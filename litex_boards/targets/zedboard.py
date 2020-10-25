@@ -96,7 +96,10 @@ class BaseSoC(SoCCore):
         oled_clk = Signal()
         oled_mosi = Signal()
 
-        self.cpu.cpu_params[f"o_SPI{SPI_N}_SS{SS_N}_O"] = oled_cs
+        if SS_N == 0:
+            self.cpu.cpu_params[f"o_SPI{SPI_N}_SS_O"] = oled_cs
+        else:
+            self.cpu.cpu_params[f"o_SPI{SPI_N}_SS{SS_N}_O"] = oled_cs
         self.cpu.cpu_params[f"o_SPI{SPI_N}_SCLK_O"] = oled_clk
         self.cpu.cpu_params[f"o_SPI{SPI_N}_MOSI_O"] = oled_mosi
         self.cpu.cpu_params[f"i_SPI{SPI_N}_MISO_I"] = 0
