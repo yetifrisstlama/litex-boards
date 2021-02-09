@@ -25,6 +25,7 @@ from liteeth.phy import LiteEthPHY
 
 class _CRG(Module):
     def __init__(self, platform, clk_freq, with_ethernet=False):
+        self.rst = Signal()
         self.clock_domains.cd_sys    = ClockDomain()
 
         # # #
@@ -35,14 +36,15 @@ class _CRG(Module):
             self.comb += platform.request("eth_rst_n").eq(1)
 
         self.submodules.pll = pll = S6PLL(speedgrade=-2)
-        self.comb += pll.reset.eq(~platform.request("user_btn_n"))
+        self.comb += pll.reset.eq(~platform.request("user_btn_n") | self.rst)
         pll.register_clkin(platform.request("clk125"), 125e6)
         pll.create_clkout(self.cd_sys, clk_freq)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, revision, sys_clk_freq=int(50e6), with_ethernet=False, with_etherbone=False, **kwargs):
+    def __init__(self, revision, sys_clk_freq=int(50e6), with_ethernet=False, with_etherbone=False, eth_ip="192.168.1.50", **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         if with_etherbone:
             sys_clk_freq = int(125e6)
@@ -67,7 +69,7 @@ class BaseSoC(SoCCore):
             if with_ethernet:
                 self.add_ethernet(phy=self.ethphy)
             if with_etherbone:
-                self.add_etherbone(phy=self.ethphy)
+                self.add_etherbone(phy=self.ethphy, ip_address=eth_ip)
 
         # Leds -------------------------------------------------------------------------------------
         self.submodules.leds = LedChaser(
@@ -79,21 +81,26 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Pano Logic G2")
-    parser.add_argument("--build",    action="store_true", help="Build bitstream")
-    parser.add_argument("--load",     action="store_true", help="Load bitstream")
-    parser.add_argument("--revision", default="c",         help="Board revision c (default) or b")
+    parser.add_argument("--build",           action="store_true",              help="Build bitstream")
+    parser.add_argument("--load",            action="store_true",              help="Load bitstream")
+    parser.add_argument("--revision",        default="c",                      help="Board revision c (default) or b")
+    parser.add_argument("--sys-clk-freq",    default=50e6,                     help="System clock frequency (default: 50MHz)")
+    ethopts = parser.add_mutually_exclusive_group()    
+    ethopts.add_argument("--with-ethernet",  action="store_true",              help="Enable Ethernet support")
+    ethopts.add_argument("--with-etherbone", action="store_true",              help="Enable Etherbone support")
+    parser.add_argument("--eth-ip",          default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address")
     builder_args(parser)
     soc_core_args(parser)
-    parser.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support")
-    parser.add_argument("--with-etherbone", action="store_true", help="Enable Etherbone support")
     args = parser.parse_args()
 
-    assert not (args.with_ethernet and args.with_etherbone)
     soc = BaseSoC(
         revision       = args.revision,
+        sys_clk_freq   = int(float(args.sys_clk_freq)),
         with_ethernet  = args.with_ethernet,
         with_etherbone = args.with_etherbone,
-        **soc_core_argdict(args))
+        eth_ip         = args.eth_ip,
+        **soc_core_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
     builder.build(run=args.build)
 

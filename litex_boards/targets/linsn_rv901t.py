@@ -31,6 +31,7 @@ from liteeth.mac import LiteEthMAC
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
+        self.rst = Signal()
         self.clock_domains.cd_sys    = ClockDomain()
         self.clock_domains.cd_sys_ps = ClockDomain(reset_less=True)
 
@@ -39,6 +40,7 @@ class _CRG(Module):
         clk25 = platform.request("clk25")
 
         self.submodules.pll = pll = S6PLL(speedgrade=-2)
+        self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(clk25, 25e6)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
         pll.create_clkout(self.cd_sys_ps, sys_clk_freq, phase=90)
@@ -49,9 +51,8 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, **kwargs):
+    def __init__(self, sys_clk_freq=int(75e6), with_ethernet=False, **kwargs):
         platform     = linsn_rv901t.Platform()
-        sys_clk_freq = int(75e6)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
@@ -64,7 +65,7 @@ class BaseSoC(SoCCore):
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"))
+            self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
             self.add_sdram("sdram",
                 phy                     = self.sdrphy,
                 module                  = M12L64322A(sys_clk_freq, "1:1"),
@@ -75,61 +76,37 @@ class BaseSoC(SoCCore):
                 l2_cache_reverse        = True
             )
 
+        # Ethernet ---------------------------------------------------------------------------------
+        if with_ethernet:
+            self.submodules.ethphy = LiteEthPHYRGMII(
+                clock_pads = self.platform.request("eth_clocks", eth_phy),
+                pads       = self.platform.request("eth", eth_phy))
+            self.add_csr("ethphy")
+            self.add_ethernet(phy=self.ethphy)
+
         # Leds -------------------------------------------------------------------------------------
         self.submodules.leds = LedChaser(
             pads         = platform.request_all("user_led"),
             sys_clk_freq = sys_clk_freq)
         self.add_csr("leds")
 
-# EthernetSoC --------------------------------------------------------------------------------------
-
-class EthernetSoC(BaseSoC):
-    mem_map = {
-        "ethmac": 0xb0000000,
-    }
-    mem_map.update(BaseSoC.mem_map)
-
-    def __init__(self, eth_phy=0, **kwargs):
-        BaseSoC.__init__(self, **kwargs)
-
-        # Ethernet ---------------------------------------------------------------------------------
-        # phy
-        self.submodules.ethphy = LiteEthPHYRGMII(
-            clock_pads = self.platform.request("eth_clocks", eth_phy),
-            pads       = self.platform.request("eth", eth_phy))
-        self.add_csr("ethphy")
-        # mac
-        self.submodules.ethmac = LiteEthMAC(
-            phy        = self.ethphy,
-            dw         = 32,
-            interface  = "wishbone",
-            endianness = self.cpu.endianness)
-        self.add_memory_region("ethmac", self.mem_map["ethmac"], 0x2000, type="io")
-        self.add_wb_slave(self.mem_map["ethmac"], self.ethmac.bus, 0x2000)
-        self.add_csr("ethmac")
-        self.add_interrupt("ethmac")
-        # timing constraints
-        self.platform.add_false_path_constraints(
-            self.crg.cd_sys.clk,
-            self.ethphy.crg.cd_eth_rx.clk,
-            self.ethphy.crg.cd_eth_tx.clk)
-
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Linsn RV901T")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
+    parser.add_argument("--build",         action="store_true", help="Build bitstream")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream")
+    parser.add_argument("--sys-clk-freq",  default=75e6,        help="System clock frequency (default: 75MHz)")
+    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
+    parser.add_argument("--eth-phy",       default=0, type=int, help="Ethernet PHY: 0 (default) or 1")
     builder_args(parser)
     soc_sdram_args(parser)
-    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
-    parser.add_argument("--eth-phy",       default=0, type=int, help="Ethernet PHY 0 or 1 (default=0)")
     args = parser.parse_args()
 
-    if args.with_ethernet:
-        soc = EthernetSoC(eth_phy=args.eth_phy, **soc_sdram_argdict(args))
-    else:
-        soc = BaseSoC(**soc_sdram_argdict(args))
+    soc = BaseSoC(
+         sys_clk_freq = int(float(args.sys_clk_freq)),
+         **soc_sdram_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
     builder.build(run=args.build)
 

@@ -9,7 +9,6 @@
 import os
 import sys
 import argparse
-
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
@@ -31,6 +30,7 @@ from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq, with_usb_pll=False):
+        self.rst = Signal()
         self.clock_domains.cd_init     = ClockDomain()
         self.clock_domains.cd_por      = ClockDomain(reset_less=True)
         self.clock_domains.cd_sys      = ClockDomain()
@@ -43,7 +43,7 @@ class _CRG(Module):
         self.reset = Signal()
 
         # Clk / Rst
-        clk25 = platform.request("refclk")
+        clk25 = platform.request("clk25")
 
         # Power on reset
         por_count = Signal(16, reset=2**16-1)
@@ -55,7 +55,7 @@ class _CRG(Module):
         # PLL
         sys2x_clk_ecsout = Signal()
         self.submodules.pll = pll = ECP5PLL()
-        self.comb += pll.reset.eq(~por_done)
+        self.comb += pll.reset.eq(~por_done | self.rst)
         pll.register_clkin(clk25, 25e6)
         pll.create_clkout(self.cd_sys2x_i, 2*sys_clk_freq)
         pll.create_clkout(self.cd_init, 24e6)
@@ -84,7 +84,7 @@ class _CRG(Module):
             self.clock_domains.cd_usb_48 = ClockDomain()
             usb_pll = ECP5PLL()
             self.submodules += usb_pll
-            self.comb += usb_pll.reset.eq(~por_done)
+            self.comb += usb_pll.reset.eq(~por_done | self.rst)
             usb_pll.register_clkin(clk25, 25e6)
             usb_pll.create_clkout(self.cd_usb_48, 48e6)
             usb_pll.create_clkout(self.cd_usb_12, 12e6)
@@ -93,8 +93,8 @@ class _CRG(Module):
 
 class BaseSoC(SoCCore):
     def __init__(self, revision="rev0", device="45F", sdram_device="MT41K512M16",
-                 with_ethernet = False,
                  sys_clk_freq  = int(75e6),
+                 with_ethernet = False,
                  toolchain     = "trellis",
                  **kwargs):
         platform = logicbone.Platform(revision=revision, device=device ,toolchain=toolchain)
@@ -102,7 +102,7 @@ class BaseSoC(SoCCore):
         # Serial -----------------------------------------------------------------------------------
         if kwargs["uart_name"] == "usb_acm":
             # FIXME: do proper install of ValentyUSB.
-            os.system("git clone https://github.com/gregdavill/valentyusb -b hw_cdc_eptri")
+            os.system("git clone https://github.com/litex-hub/valentyusb -b hw_cdc_eptri")
             sys.path.append("valentyusb")
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -158,26 +158,27 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Logicbone")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
-    parser.add_argument("--toolchain", default="trellis", help="Gateware toolchain to use, trellis (default) or diamond")
+    parser.add_argument("--build",          action="store_true",   help="Build bitstream")
+    parser.add_argument("--load",           action="store_true",   help="Load bitstream")
+    parser.add_argument("--toolchain",      default="trellis",     help="FPGA toolchain: trellis (default) or diamond")
+    parser.add_argument("--sys-clk-freq",   default=75e6,          help="System clock frequency (default: 75MHz)")
+    parser.add_argument("--device",         default="45F",         help="FPGA device: (default: 45F)")
+    parser.add_argument("--sdram-device",   default="MT41K512M16", help="SDRAM device (default: MT41K512M16)")
+    parser.add_argument("--with-ethernet",  action="store_true",   help="Enable Ethernet support")
+    parser.add_argument("--with-sdcard",    action="store_true",   help="Enable SDCard support")
     builder_args(parser)
     soc_sdram_args(parser)
     trellis_args(parser)
-    parser.add_argument("--sys-clk-freq",   default=75e6,           help="System clock frequency (default=75MHz)")
-    parser.add_argument("--device",         default="45F",          help="ECP5 device (default=45F)")
-    parser.add_argument("--sdram-device",   default="MT41K512M16",  help="ECP5 device (default=MT41K512M16)")
-    parser.add_argument("--with-ethernet",  action="store_true",    help="enable Ethernet support")
-    parser.add_argument("--with-sdcard",    action="store_true",    help="enable SDCard support")
     args = parser.parse_args()
 
     soc = BaseSoC(
         toolchain     = args.toolchain,
         device        = args.device,
+        sys_clk_freq  = int(float(args.sys_clk_freq)),
         sdram_device  = args.sdram_device,
         with_ethernet = args.with_ethernet,
-        sys_clk_freq  = int(float(args.sys_clk_freq)),
-        **soc_sdram_argdict(args))
+        **soc_sdram_argdict(args)
+    )
     if args.with_sdcard:
         soc.add_sdcard()
     builder = Builder(soc, **builder_argdict(args))

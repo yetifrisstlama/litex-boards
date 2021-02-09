@@ -4,7 +4,7 @@
 # This file is part of LiteX-Boards.
 #
 # Copyright (c) 2019 Vamsi K Vytla <vamsi.vytla@gmail.com>
-# Copyright (c) 2019 Florent Kermarrec <florent@enjoy-digital.fr>
+# Copyright (c) 2019-2020 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
 import os
@@ -28,31 +28,36 @@ from liteeth.phy.a7_gtp import QPLLSettings, QPLL
 from liteeth.phy.a7_1000basex import A7_1000BASEX
 from liteeth.phy.s7rgmii import LiteEthPHYRGMII
 
+from litepcie.phy.s7pciephy import S7PCIEPHY
+from litepcie.software import generate_litepcie_software
+
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
+        self.rst = Signal()
         self.clock_domains.cd_sys       = ClockDomain()
         self.clock_domains.cd_sys4x     = ClockDomain(reset_less=True)
         self.clock_domains.cd_sys4x_dqs = ClockDomain(reset_less=True)
-        self.clock_domains.cd_clk200    = ClockDomain()
+        self.clock_domains.cd_idelay    = ClockDomain()
 
         # # #
 
         self.submodules.pll = pll = S7PLL(speedgrade=-1)
-        self.comb += pll.reset.eq(platform.request("cpu_reset"))
+        self.comb += pll.reset.eq(platform.request("cpu_reset") | self.rst)
         pll.register_clkin(platform.request("clk200"), 200e6)
         pll.create_clkout(self.cd_sys,       sys_clk_freq)
         pll.create_clkout(self.cd_sys4x,     4*sys_clk_freq)
         pll.create_clkout(self.cd_sys4x_dqs, 4*sys_clk_freq, phase=90)
         pll.create_clkout(self.cd_idelay,    200e6)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
         self.submodules.idelayctrl = S7IDELAYCTRL(self.cd_idelay)
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(100e6), with_ethernet=False, ethernet_phy="rgmii", **kwargs):
+    def __init__(self, sys_clk_freq=int(100e6), with_ethernet=False, eth_phy="rgmii", with_pcie=False, **kwargs):
         platform = ac701.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -85,7 +90,7 @@ class BaseSoC(SoCCore):
         # Ethernet ---------------------------------------------------------------------------------
         if with_ethernet:
             # RGMII Ethernet PHY -------------------------------------------------------------------
-            if ethernet_phy == "rgmii":
+            if eth_phy == "rgmii":
                 # phy
                 self.submodules.ethphy = LiteEthPHYRGMII(
                     clock_pads = self.platform.request("eth_clocks"),
@@ -93,7 +98,7 @@ class BaseSoC(SoCCore):
                 self.add_csr("ethphy")
 
             # 1000BaseX Ethernet PHY ---------------------------------------------------------------
-            if ethernet_phy == "1000basex":
+            if eth_phy == "1000basex":
                 # phy
                 self.comb += self.platform.request("sfp_mgt_clk_sel0", 0).eq(0)
                 self.comb += self.platform.request("sfp_mgt_clk_sel1", 0).eq(0)
@@ -120,6 +125,14 @@ class BaseSoC(SoCCore):
 
             self.add_ethernet(phy=self.ethphy)
 
+        # PCIe -------------------------------------------------------------------------------------
+        if with_pcie:
+            self.submodules.pcie_phy = S7PCIEPHY(platform, platform.request("pcie_x4"),
+                data_width = 128,
+                bar0_size  = 0x20000)
+            self.add_csr("pcie_phy")
+            self.add_pcie(phy=self.pcie_phy, ndmas=1)
+
         # Leds -------------------------------------------------------------------------------------
         self.submodules.leds = LedChaser(
             pads         = platform.request_all("user_led"),
@@ -131,15 +144,27 @@ def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on AC701")
     builder_args(parser)
     soc_sdram_args(parser)
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
+    parser.add_argument("--build",         action="store_true", help="Build bitstream")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream")
+    parser.add_argument("--sys-clk-freq",  default=100e6,       help="System clock frequency (default: 100MHz)")
     parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
-    parser.add_argument("--ethernet-phy",  default="rgmii",     help="Select Ethernet PHY (rgmii or 1000basex)")
+    parser.add_argument("--eth-phy",       default="rgmii",     help="Select Ethernet PHY: rgmii (default) or 1000basex")
+    parser.add_argument("--with-pcie",     action="store_true", help="Enable PCIe support")
+    parser.add_argument("--driver",        action="store_true", help="Generate PCIe driver")
     args = parser.parse_args()
 
-    soc = BaseSoC(with_ethernet=args.with_ethernet, ethernet_phy=args.ethernet_phy, **soc_sdram_argdict(args))
+    soc = BaseSoC(
+        sys_clk_freq  = int(float(args.sys_clk_freq)),
+        with_ethernet = args.with_ethernet,
+        eth_phy       = args.eth_phy,
+        with_pcie     = args.with_pcie,
+        **soc_sdram_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
     builder.build(run=args.build)
+
+    if args.driver:
+        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
 
     if args.load:
         prog = soc.platform.create_programmer()

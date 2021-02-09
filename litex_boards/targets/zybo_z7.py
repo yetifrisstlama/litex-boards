@@ -26,6 +26,7 @@ from litex.soc.cores.led import LedChaser
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq, use_ps7_clk=False):
+        self.rst = Signal()
         self.clock_domains.cd_sys = ClockDomain()
 
         # # #
@@ -33,11 +34,13 @@ class _CRG(Module):
         if use_ps7_clk:
             assert sys_clk_freq == 100e6
             self.comb += ClockSignal("sys").eq(ClockSignal("ps7"))
-            self.comb += ResetSignal("sys").eq(ResetSignal("ps7"))
+            self.comb += ResetSignal("sys").eq(ResetSignal("ps7") | self.rst)
         else:
             self.submodules.pll = pll = S7PLL(speedgrade=-1)
+            self.comb += pll.reset.eq(self.rst)
             pll.register_clkin(platform.request("clk125"), 125e6)
-            pll.create_clkout(self.cd_sys,       sys_clk_freq)
+            pll.create_clkout(self.cd_sys, sys_clk_freq)
+            platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
@@ -82,14 +85,18 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Zybo Z7")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
+    parser.add_argument("--build",        action="store_true", help="Build bitstream")
+    parser.add_argument("--load",         action="store_true", help="Load bitstream")
+    parser.add_argument("--sys-clk-freq", default=100e6,       help="System clock frequency (default: 100MHz)")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)
     args = parser.parse_args()
 
-    soc = BaseSoC(**soc_core_argdict(args))
+    soc = BaseSoC(
+        sys_clk_freq = int(float(args.sys_clk_freq)),
+        **soc_core_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
     builder.build(**vivado_build_argdict(args), run=args.build)
 

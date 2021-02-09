@@ -23,6 +23,7 @@ from litex.soc.cores.led import LedChaser
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq, x5_clk_freq):
+        self.rst = Signal()
         self.clock_domains.cd_sys = ClockDomain()
 
         # # #
@@ -37,7 +38,7 @@ class _CRG(Module):
 
         # pll
         self.submodules.pll = pll = ECP5PLL()
-        self.comb += pll.reset.eq(~rst_n)
+        self.comb += pll.reset.eq(~rst_n | self.rst)
         pll.register_clkin(clk, x5_clk_freq or 12e6)
         pll.create_clkout(self.cd_sys, sys_clk_freq)
 
@@ -67,13 +68,13 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on ECP5 Evaluation Board")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
-    parser.add_argument("--toolchain", default="trellis", help="Gateware toolchain to use, trellis (default) or diamond")
+    parser.add_argument("--build",        action="store_true", help="Build bitstream")
+    parser.add_argument("--load",         action="store_true", help="Load bitstream")
+    parser.add_argument("--toolchain",    default="trellis",   help="FPGA toolchain: trellis (default) or diamond")
+    parser.add_argument("--sys-clk-freq", default=60e6,        help="System clock frequency (default: 60MHz)")
+    parser.add_argument("--x5-clk-freq",  type=int,            help="Use X5 oscillator as system clock at the specified frequency")
     builder_args(parser)
     soc_core_args(parser)
-    parser.add_argument("--sys-clk-freq", default=60e6, help="System clock frequency (default=60MHz)")
-    parser.add_argument("--x5-clk-freq",  type=int,     help="Use X5 oscillator as system clock at the specified frequency")
     args = parser.parse_args()
 
     soc = BaseSoC(toolchain=args.toolchain,

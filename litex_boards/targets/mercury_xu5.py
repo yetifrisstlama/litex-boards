@@ -10,7 +10,7 @@ import os
 import argparse
 
 from migen import *
-from migen.genlib.io import CRG
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex_boards.platforms import mercury_xu5
 
@@ -27,6 +27,7 @@ from litedram.phy import usddrphy
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
+        self.rst = Signal()
         self.clock_domains.cd_sys    = ClockDomain()
         self.clock_domains.cd_sys4x  = ClockDomain(reset_less=True)
         self.clock_domains.cd_pll4x  = ClockDomain(reset_less=True)
@@ -35,10 +36,11 @@ class _CRG(Module):
         # # #
 
         self.submodules.pll = pll = USMMCM(speedgrade=-1)
+        self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(platform.request("clk100"), 100e6)
-
         pll.create_clkout(self.cd_pll4x, sys_clk_freq*4, buf=None, with_reset=False)
         pll.create_clkout(self.cd_idelay, 500e6, with_reset=False)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
         self.specials += [
             Instance("BUFGCE_DIV", name="main_bufgce_div",
@@ -93,13 +95,17 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Mercury XU5")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
+    parser.add_argument("--build",        action="store_true", help="Build bitstream")
+    parser.add_argument("--load",         action="store_true", help="Load bitstream")
+    parser.add_argument("--sys-clk-freq", default=125e6,       help="System clock frequency (default: 125MHz)")
     builder_args(parser)
     soc_sdram_args(parser)
     args = parser.parse_args()
 
-    soc = BaseSoC(**soc_sdram_argdict(args))
+    soc = BaseSoC(
+         sys_clk_freq = int(float(args.sys_clk_freq)),
+         **soc_sdram_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
     builder.build(run=args.build)
 

@@ -20,6 +20,7 @@ from litex.build.lattice.trellis import trellis_args, trellis_argdict
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
+from litex.soc.cores.led import LedChaser
 
 from litedram.modules import MT41K256M16
 from litedram.phy import ECP5DDRPHY
@@ -30,6 +31,7 @@ from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
+        self.rst = Signal()
         self.clock_domains.cd_init    = ClockDomain()
         self.clock_domains.cd_por     = ClockDomain(reset_less=True)
         self.clock_domains.cd_sys     = ClockDomain()
@@ -54,7 +56,7 @@ class _CRG(Module):
 
         # PLL
         self.submodules.pll = pll = ECP5PLL()
-        self.comb += pll.reset.eq(~por_done | ~rst_n)
+        self.comb += pll.reset.eq(~por_done | ~rst_n | self.rst)
         pll.register_clkin(clk100, 100e6)
         pll.create_clkout(self.cd_sys2x_i, 2*sys_clk_freq)
         pll.create_clkout(self.cd_init, 25e6)
@@ -69,15 +71,15 @@ class _CRG(Module):
                 i_CLKI    = self.cd_sys2x.clk,
                 i_RST     = self.reset,
                 o_CDIVX   = self.cd_sys.clk),
-            AsyncResetSynchronizer(self.cd_sys,   ~pll.locked | self.reset),
-            AsyncResetSynchronizer(self.cd_sys2x, ~pll.locked | self.reset),
+            AsyncResetSynchronizer(self.cd_sys,   ~pll.locked | self.reset | self.rst),
+            AsyncResetSynchronizer(self.cd_sys2x, ~pll.locked | self.reset | self.rst),
         ]
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(75e6), with_ethernet=False, **kwargs):
-        platform = ecpix5.Platform(toolchain="trellis")
+    def __init__(self, device="85F", sys_clk_freq=int(75e6), with_ethernet=False, **kwargs):
+        platform = ecpix5.Platform(device=device, toolchain="trellis")
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
@@ -110,30 +112,44 @@ class BaseSoC(SoCCore):
         if with_ethernet:
             self.submodules.ethphy = LiteEthPHYRGMII(
                 clock_pads = self.platform.request("eth_clocks"),
-                pads       = self.platform.request("eth"))
+                pads       = self.platform.request("eth"),
+                rx_delay   = 0e-9)
             self.add_csr("ethphy")
             self.add_ethernet(phy=self.ethphy)
 
-        # Leds (Disable...) ------------------------------------------------------------------------
+        # Leds -------------------------------------------------------------------------------------
+        leds_pads = []
         for i in range(4):
             rgb_led_pads = platform.request("rgb_led", i)
-            for c in "rgb":
-                self.comb += getattr(rgb_led_pads, c).eq(1)
+            self.comb += [getattr(rgb_led_pads, n).eq(1) for n in "gb"] # Disable Green/Blue Leds.
+            leds_pads += [getattr(rgb_led_pads, n) for n in "r"]
+        self.submodules.leds = LedChaser(
+            pads         = Cat(leds_pads),
+            sys_clk_freq = sys_clk_freq)
+        self.add_csr("leds")
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on ECPIX-5")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
-    parser.add_argument("--with-sdcard", action="store_true",     help="Enable SDCard support")
+    parser.add_argument("--build",         action="store_true", help="Build bitstream")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream")
+    parser.add_argument("--flash",         action="store_true", help="Flash bitstream to SPI Flash")
+    parser.add_argument("--device",        default="85F",       help="ECP5 device (default: 85F)")
+    parser.add_argument("--sys-clk-freq",  default=75e6,        help="System clock frequency (default: 75MHz)")
+    parser.add_argument("--with-sdcard",   action="store_true", help="Enable SDCard support")
+    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)
-    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
     args = parser.parse_args()
 
-    soc     = BaseSoC(with_ethernet=args.with_ethernet, **soc_core_argdict(args))
+    soc = BaseSoC(
+        device = args.device,
+        sys_clk_freq  = int(float(args.sys_clk_freq)),
+        with_ethernet = args.with_ethernet,
+        **soc_core_argdict(args)
+    )
     if args.with_sdcard:
         soc.add_sdcard()
     builder = Builder(soc, **builder_argdict(args))
@@ -141,7 +157,11 @@ def main():
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".svf"))
+        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
+
+    if args.flash:
+        prog = soc.platform.create_programmer()
+        prog.flash(None, os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
 
 if __name__ == "__main__":
     main()

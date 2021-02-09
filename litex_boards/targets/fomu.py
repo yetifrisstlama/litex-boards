@@ -33,6 +33,7 @@ mB = 1024*kB
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
         assert sys_clk_freq == 12e6
+        self.rst = Signal()
         self.clock_domains.cd_sys    = ClockDomain()
         self.clock_domains.cd_por    = ClockDomain(reset_less=True)
         self.clock_domains.cd_usb_12 = ClockDomain()
@@ -53,6 +54,7 @@ class _CRG(Module):
 
         # USB PLL
         self.submodules.pll = pll = iCE40PLL()
+        self.comb += pll.reset.eq(self.rst)
         pll.clko_freq_range = ( 12e6,  275e9) # FIXME: improve iCE40PLL to avoid lowering clko_freq_min.
         pll.register_clkin(clk48, 48e6)
         pll.create_clkout(self.cd_usb_12, 12e6, with_reset=False)
@@ -68,9 +70,8 @@ class _CRG(Module):
 
 class BaseSoC(SoCCore):
     mem_map = {**SoCCore.mem_map, **{"spiflash": 0x80000000}}
-    def __init__(self, bios_flash_offset, **kwargs):
+    def __init__(self, bios_flash_offset, sys_clk_freq=int(12e6), **kwargs):
         kwargs["uart_name"] = "usb_acm" # Enforce UART to USB-ACM
-        sys_clk_freq = int(12e6)
         platform = fomu_pvt.Platform()
 
         # Disable Integrated ROM/SRAM since too large for iCE40 and UP5K has specific SPRAM.
@@ -82,8 +83,7 @@ class BaseSoC(SoCCore):
 
         # Serial -----------------------------------------------------------------------------------
         # FIXME: do proper install of ValentyUSB.
-        # FIXME: replace IoBuf with https://github.com/im-tomu/valentyusb/blob/master/valentyusb/usbcore/io.py#L13-L61.
-        os.system("git clone https://github.com/gregdavill/valentyusb -b hw_cdc_eptri")
+        os.system("git clone https://github.com/litex-hub/valentyusb -b hw_cdc_eptri")
         sys.path.append("valentyusb")
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -146,14 +146,19 @@ def flash(bios_flash_offset):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Fomu")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--bios-flash-offset", default=0x60000, help="BIOS offset in SPI Flash")
+    parser.add_argument("--build",             action="store_true", help="Build bitstream")
+    parser.add_argument("--sys-clk-freq",      default=12e6,        help="System clock frequency (default: 12MHz)")
+    parser.add_argument("--bios-flash-offset", default=0x60000,     help="BIOS offset in SPI Flash (default: 0x60000)")
     parser.add_argument("--flash",             action="store_true", help="Flash Bitstream")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()
 
-    soc = BaseSoC(args.bios_flash_offset, **soc_core_argdict(args))
+    soc = BaseSoC(
+        bios_flash_offset = args.bios_flash_offset,
+        sys_clk_freq      = int(float(args.sys_clk_freq)),
+        **soc_core_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
     builder.build(run=args.build)
 

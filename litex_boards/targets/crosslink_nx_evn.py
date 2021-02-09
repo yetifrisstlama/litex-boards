@@ -15,7 +15,8 @@ from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex_boards.platforms import crosslink_nx_evn
 
-from litex.soc.cores.nxlram import NXLRAM
+from litex.soc.cores.ram import NXLRAM
+from litex.soc.cores.clock import NXPLL
 from litex.soc.cores.spi_flash import SpiFlash
 from litex.build.io import CRG
 from litex.build.generic_platform import *
@@ -25,6 +26,8 @@ from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
 from litex.soc.cores.led import LedChaser
 
+from litex.build.lattice.oxide import oxide_args, oxide_argdict
+
 kB = 1024
 mB = 1024*kB
 
@@ -33,23 +36,28 @@ mB = 1024*kB
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
-        self.clock_domains.cd_sys = ClockDomain()
         self.clock_domains.cd_por = ClockDomain()
+        self.clock_domains.cd_sys = ClockDomain()
 
-        # TODO: replace with PLL
-        # Clocking
-        self.submodules.sys_clk = sys_osc = NXOSCA()
-        sys_osc.create_hf_clk(self.cd_sys, sys_clk_freq)
-        platform.add_period_constraint(self.cd_sys.clk, 1e9/sys_clk_freq)
-        rst_n = platform.request("gsrn")
+        # Built in OSC
+        self.submodules.hf_clk = NXOSCA()
+        hf_clk_freq = 25e6
+        self.hf_clk.create_hf_clk(self.cd_por, hf_clk_freq)
 
-        # Power On Reset
-        por_cycles  = 4096
-        por_counter = Signal(log2_int(por_cycles), reset=por_cycles-1)
-        self.comb += self.cd_por.clk.eq(self.cd_sys.clk)
-        self.sync.por += If(por_counter != 0, por_counter.eq(por_counter - 1))
-        self.specials += AsyncResetSynchronizer(self.cd_por, ~rst_n)
-        self.specials += AsyncResetSynchronizer(self.cd_sys, (por_counter != 0))
+        # Power on reset
+        por_count = Signal(16, reset=2**16-1)
+        por_done  = Signal()
+        self.comb += por_done.eq(por_count == 0)
+        self.sync.por += If(~por_done, por_count.eq(por_count - 1))
+
+        self.rst_n = platform.request("gsrn")
+        self.specials += AsyncResetSynchronizer(self.cd_por, ~self.rst_n)
+
+        # PLL
+        self.submodules.sys_pll = sys_pll = NXPLL(platform=platform, create_output_port_clocks=True)
+        sys_pll.register_clkin(self.cd_por.clk, hf_clk_freq)
+        sys_pll.create_clkout(self.cd_sys, sys_clk_freq)
+        self.specials += AsyncResetSynchronizer(self.cd_sys, ~self.sys_pll.locked | ~por_done )
 
 
 # BaseSoC ------------------------------------------------------------------------------------------
@@ -60,9 +68,8 @@ class BaseSoC(SoCCore):
         "sram":             0x40000000,
         "csr":              0xf0000000,
     }
-    def __init__(self, sys_clk_freq, **kwargs):
-        platform = crosslink_nx_evn.Platform()
-
+    def __init__(self, sys_clk_freq=int(75e6), toolchain="radiant", **kwargs):
+        platform = crosslink_nx_evn.Platform(toolchain=toolchain)
         platform.add_platform_command("ldc_set_sysconfig {{MASTER_SPI_PORT=SERIAL}}")
 
         # Disable Integrated SRAM since we want to instantiate LRAM specifically for it
@@ -73,8 +80,8 @@ class BaseSoC(SoCCore):
 
         # SoCCore -----------------------------------------_----------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Crosslink-NX Evaluation Board",
-            ident_version  = True,
+            ident         = "LiteX SoC on Crosslink-NX Evaluation Board",
+            ident_version = True,
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -96,18 +103,24 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Crosslink-NX Eval Board")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load", action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",  default=75e6, help="System clock frequency (default=75MHz)")
-    parser.add_argument("--serial",  default="serial", help="UART Pins: serial (requires R15 and R17 to be soldered) or serial_pmod[0-2] (default=serial)")
-    parser.add_argument("--prog-target",  default="direct", help="Programming Target: direct or flash")
+    parser.add_argument("--build",         action="store_true", help="Build bitstream")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream")
+    parser.add_argument("--toolchain",     default="radiant",   help="FPGA toolchain: radiant (default) or prjoxide")
+    parser.add_argument("--sys-clk-freq",  default=75e6,        help="System clock frequency (default: 75MHz)")
+    parser.add_argument("--serial",        default="serial",    help="UART Pins: serial (default, requires R15 and R17 to be soldered) or serial_pmod[0-2]")
+    parser.add_argument("--prog-target",   default="direct",    help="Programming Target: direct or flash")
     builder_args(parser)
     soc_core_args(parser)
+    oxide_args(parser)
     args = parser.parse_args()
 
-    soc = BaseSoC(sys_clk_freq=int(float(args.sys_clk_freq)), **soc_core_argdict(args))
+    soc = BaseSoC(
+        sys_clk_freq = int(float(args.sys_clk_freq)),
+        toolchain    = args.toolchain,
+        **soc_core_argdict(args)
+    )
     builder = Builder(soc, **builder_argdict(args))
-    builder_kargs = {}
+    builder_kargs = oxide_argdict(args) if args.toolchain == "oxide" else {}
     builder.build(**builder_kargs, run=args.build)
 
     if args.load:

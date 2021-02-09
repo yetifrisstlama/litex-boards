@@ -10,6 +10,7 @@ import os
 import argparse
 
 from migen import *
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex_boards.platforms import xcu1525
 
@@ -23,15 +24,13 @@ from litedram.modules import MT40A512M8
 from litedram.phy import usddrphy
 
 from litepcie.phy.usppciephy import USPPCIEPHY
-from litepcie.core import LitePCIeEndpoint, LitePCIeMSI
-from litepcie.frontend.dma import LitePCIeDMA
-from litepcie.frontend.wishbone import LitePCIeWishboneBridge
 from litepcie.software import generate_litepcie_software
 
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq, ddram_channel):
+        self.rst = Signal()
         self.clock_domains.cd_sys    = ClockDomain()
         self.clock_domains.cd_sys4x  = ClockDomain(reset_less=True)
         self.clock_domains.cd_pll4x  = ClockDomain(reset_less=True)
@@ -40,9 +39,11 @@ class _CRG(Module):
         # # #
 
         self.submodules.pll = pll = USPMMCM(speedgrade=-2)
+        self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(platform.request("clk300", ddram_channel), 300e6)
         pll.create_clkout(self.cd_pll4x, sys_clk_freq*4, buf=None, with_reset=False)
         pll.create_clkout(self.cd_idelay, 500e6, with_reset=False)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
         self.specials += [
             Instance("BUFGCE_DIV", name="main_bufgce_div",
@@ -58,7 +59,7 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(125e6), ddram_channel=0, with_pcie=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(125e6), ddram_channel=0, with_pcie=False, with_sata=False, **kwargs):
         platform = xcu1525.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -92,40 +93,45 @@ class BaseSoC(SoCCore):
 
         # PCIe -------------------------------------------------------------------------------------
         if with_pcie:
-            # PHY
             self.submodules.pcie_phy = USPPCIEPHY(platform, platform.request("pcie_x4"),
                 data_width = 128,
                 bar0_size  = 0x20000)
-            platform.add_false_path_constraints(self.crg.cd_sys.clk, self.pcie_phy.cd_pcie.clk)
             self.add_csr("pcie_phy")
+            self.add_pcie(phy=self.pcie_phy, ndmas=1)
 
-            # Endpoint
-            self.submodules.pcie_endpoint = LitePCIeEndpoint(self.pcie_phy, max_pending_requests=8)
+        # SATA -------------------------------------------------------------------------------------
+        if with_sata:
+            from litex.build.generic_platform import Subsignal, Pins
+            from litesata.phy import LiteSATAPHY
 
-            # Wishbone bridge
-            self.submodules.pcie_bridge = LitePCIeWishboneBridge(self.pcie_endpoint,
-                base_address = self.mem_map["csr"])
-            self.add_wb_master(self.pcie_bridge.wishbone)
+            # IOs
+            _sata_io = [
+                # SFP 2 SATA Adapter / https://shop.trenz-electronic.de/en/TE0424-01-SFP-2-SATA-Adapter
+                ("qsfp2sata", 0,
+                    Subsignal("tx_p", Pins("N9")),
+                    Subsignal("tx_n", Pins("N8")),
+                    Subsignal("rx_p", Pins("N4")),
+                    Subsignal("rx_n", Pins("N3")),
+                ),
+            ]
+            platform.add_extension(_sata_io)
 
-            # DMA0
-            self.submodules.pcie_dma0 = LitePCIeDMA(self.pcie_phy, self.pcie_endpoint,
-                with_buffering = True, buffering_depth=1024,
-                with_loopback  = True)
-            self.add_csr("pcie_dma0")
+            # RefClk, Generate 150MHz from PLL.
+            self.clock_domains.cd_sata_refclk = ClockDomain()
+            self.crg.pll.create_clkout(self.cd_sata_refclk, 150e6)
+            sata_refclk = ClockSignal("sata_refclk")
 
-            self.add_constant("DMA_CHANNELS", 1)
+            # PHY
+            self.submodules.sata_phy = LiteSATAPHY(platform.device,
+                refclk     = sata_refclk,
+                pads       = platform.request("qsfp2sata"),
+                gen        = "gen2",
+                clk_freq   = sys_clk_freq,
+                data_width = 16)
+            self.add_csr("sata_phy")
 
-            # MSI
-            self.submodules.pcie_msi = LitePCIeMSI()
-            self.add_csr("pcie_msi")
-            self.comb += self.pcie_msi.source.connect(self.pcie_phy.msi)
-            self.interrupts = {
-                "PCIE_DMA0_WRITER":    self.pcie_dma0.writer.irq,
-                "PCIE_DMA0_READER":    self.pcie_dma0.reader.irq,
-            }
-            for i, (k, v) in enumerate(sorted(self.interrupts.items())):
-                self.comb += self.pcie_msi.irqs[i].eq(v)
-                self.add_constant(k + "_INTERRUPT", i)
+            # Core
+            self.add_sata(phy=self.sata_phy, mode="read+write")
 
         # Leds -------------------------------------------------------------------------------------
         self.submodules.leds = LedChaser(
@@ -138,21 +144,23 @@ class BaseSoC(SoCCore):
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on XCU1525")
     parser.add_argument("--build",         action="store_true", help="Build bitstream")
-    parser.add_argument("--ddram-channel", default="0",         help="DDRAM channel")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream")
+    parser.add_argument("--sys-clk-freq",  default=125e6,       help="System clock frequency (default: 125MHz)")
+    parser.add_argument("--ddram-channel", default="0",         help="DDRAM channel (default: 0)")
     parser.add_argument("--with-pcie",     action="store_true", help="Enable PCIe support")
     parser.add_argument("--driver",        action="store_true", help="Generate PCIe driver")
-    parser.add_argument("--load",          action="store_true", help="Load bitstream")
+    parser.add_argument("--with-sata",     action="store_true", help="Enable SATA support (over SFP2SATA)")
     builder_args(parser)
     soc_sdram_args(parser)
     args = parser.parse_args()
 
-    # Enforce arguments
-    args.csr_data_width = 32
-
-    soc =  BaseSoC(
+    soc = BaseSoC(
+        sys_clk_freq  = int(float(args.sys_clk_freq)),
         ddram_channel = int(args.ddram_channel, 0),
         with_pcie     = args.with_pcie,
-        **soc_sdram_argdict(args))
+        with_sata     = args.with_sata,
+        **soc_sdram_argdict(args)
+	)
     builder = Builder(soc, **builder_argdict(args))
     builder.build(run=args.build)
 
